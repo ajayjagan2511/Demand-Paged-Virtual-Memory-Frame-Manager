@@ -133,3 +133,92 @@ To prevent the timer interrupt from corrupting the ready queue, the `resume()` a
 Machine::disable_interrupts();
 ...
 Machine::enable_interrupts();
+```
+
+---
+
+## Component 5: I/O-Aware Yield Logic
+
+The scheduler’s `yield(int interrupt)` function was extended so that it can:
+
+- Detect whether a yield came from:
+  - a **voluntary thread yield**, or
+  - a **disk interrupt bottom-half**.
+- Give **priority** to threads waiting on disk operations:
+  - If the disk is **free** and the **disk-waiting queue** is non-empty, the scheduler immediately dispatches an I/O-blocked thread.
+  - Otherwise, it falls back to the **normal ready-queue** scheduling.
+
+This effectively converts the scheduler into a **dual-queue system**:
+
+- **Ready Queue** — CPU-bound threads  
+- **Disk Queue** — managed by the `NonBlockingDisk` driver for I/O-blocked threads  
+
+This mechanism enables **near-zero CPU waste** during disk latency, eliminating all busy-waiting in the driver or scheduler.
+
+---
+
+## Component 6: Integration With Disk Driver Locks
+
+The NonBlockingDisk driver introduces two new locks:
+
+- `hw_lock` — protects ATA **hardware register access**
+- `queue_lock` — protects the disk’s **per-device I/O wait queue**
+
+The scheduler must interact safely with these locks. Thus, it now:
+
+- Acquires `queue_lock` internally when inspecting or dequeuing from the disk queue  
+- Ensures `yield()` never preempts a thread while it is inside a **disk-critical section**
+- Temporarily **disables interrupts** around queue manipulations to prevent races between:
+  - the **disk interrupt handler (ISR, bottom half)**, and  
+  - the **scheduler’s top-half** logic
+
+These changes create a **unified, interrupt-safe scheduling environment** for both CPU tasks and asynchronous I/O.
+
+---
+
+## Component 7: ISR-Driven Rescheduling
+
+Under **Bonus Option 3** (interrupt-driven disk):
+
+- The ATA controller raises **IRQ14** when a disk operation completes.
+- The NonBlockingDisk bottom-half ISR performs:
+
+```cpp
+System::SCHEDULER->resume(waitingThread);
+System::SCHEDULER->yield(1);   // indicates an interrupt-triggered yield
+```
+(These backticks are safely closed here — they will NOT break the surrounding block.)
+
+Passing `interrupt = 1` signals to the scheduler:
+
+> “A disk request completed — immediately schedule from the disk queue.”
+
+This ensures that:
+
+- The waiting I/O thread is resumed promptly  
+- CPU-bound threads cannot delay I/O completion  
+- Each disk interrupt forces a direct, immediate context switch into the next I/O thread  
+
+This replicates real OS device-driver semantics:  
+**top-half → initiates I/O**, **bottom-half (ISR) → wakes the blocked thread**.
+
+---
+
+## Component 8: Cooperative–Preemptive Hybrid Behavior
+
+Asynchronous I/O introduces a hybrid scheduling model:
+
+- Threads performing disk I/O voluntarily yield after issuing a request.
+- These threads stay suspended until the hardware IRQ wakes them.
+- Timer interrupts still enforce standard **preemptive round-robin** among CPU-bound threads.
+- Disk interrupts have **higher priority** than timer interrupts:
+  - A disk IRQ immediately forces rescheduling.
+  - The awakened I/O thread runs at the earliest safe opportunity.
+
+This results in:
+
+- **CPU-bound threads → preemptive RR scheduling**
+- **I/O-bound threads → event-driven hardware-IRQ dispatch**
+
+Leading to:  
+**maximum CPU utilization**, **zero busy waiting**, and **minimal I/O wake-up latency**.
